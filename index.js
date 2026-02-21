@@ -5,8 +5,27 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { MongoClient, ServerApiVersion, ObjectId } from "mongodb";
 import logger from "./utils/logger.js";
+import { initializeApp as initFirebaseAdmin, cert } from "firebase-admin/app";
+import { getAuth as getAdminAuth } from "firebase-admin/auth";
 
 dotenv.config();
+
+// ==================== FIREBASE ADMIN SDK ====================
+
+if (!process.env.FIREBASE_PROJECT_ID || !process.env.FIREBASE_CLIENT_EMAIL || !process.env.FIREBASE_PRIVATE_KEY) {
+  console.error("❌ Missing Firebase Admin env vars: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY");
+  console.error("   Add them to your .env file. Get them from Firebase Console → Project Settings → Service Accounts → Generate New Private Key");
+  process.exit(1);
+}
+
+const firebaseAdminApp = initFirebaseAdmin({
+  credential: cert({
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  }),
+});
+const adminAuth = getAdminAuth(firebaseAdminApp);
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -449,6 +468,9 @@ const ROLE_PERMISSIONS = {
     "view_activity_logs",
   ],
   moderator: [
+    "view_classes",
+    "view_sections",
+    "view_subjects",
     "view_students",
     "view_teachers",
     "view_attendance",
@@ -460,6 +482,9 @@ const ROLE_PERMISSIONS = {
     "view_reports",
   ],
   teacher: [
+    "view_classes",
+    "view_sections",
+    "view_subjects",
     "view_students",
     "view_attendance",
     "mark_attendance",
@@ -473,6 +498,9 @@ const ROLE_PERMISSIONS = {
     "view_reports",
   ],
   student: [
+    "view_classes",
+    "view_sections",
+    "view_subjects",
     "view_attendance",
     "view_published_grades",
     "view_fees",
@@ -480,6 +508,8 @@ const ROLE_PERMISSIONS = {
     "upload_own_documents",
   ],
   parent: [
+    "view_classes",
+    "view_sections",
     "view_attendance",
     "view_published_grades",
     "view_fees",
@@ -867,6 +897,28 @@ function buildCsvString(headers, rows) {
   return [headerLine, ...dataLines].join("\n");
 }
 
+// ==================== FIREBASE HELPER ====================
+
+// Creates a Firebase Auth account for new users.
+// If the email already exists in Firebase, returns the existing UID.
+const createFirebaseUser = async (email, password, displayName) => {
+  try {
+    const userRecord = await adminAuth.createUser({
+      email,
+      password,
+      displayName,
+      emailVerified: false,
+    });
+    return { uid: userRecord.uid, alreadyExisted: false };
+  } catch (err) {
+    if (err.code === "auth/email-already-exists") {
+      const existing = await adminAuth.getUserByEmail(email);
+      return { uid: existing.uid, alreadyExisted: true };
+    }
+    throw err;
+  }
+};
+
 // ==================== INITIALIZE DATABASE ====================
 
 connectDB().catch((err) => {
@@ -967,6 +1019,171 @@ app.get(
       res.status(500).json({
         success: false,
         message: "Failed to fetch subscription",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// GET /subscriptions/my-request - Get the current org's pending subscription request
+app.get(
+  "/subscriptions/my-request",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  checkOrganizationSuspension,
+  async (req, res) => {
+    try {
+      if (req.userRole !== "org_owner") {
+        return res.status(403).json({
+          success: false,
+          message: "Only organization owners can access subscription requests",
+        });
+      }
+
+      const request = await subscriptionRequestsCollection.findOne(
+        { organizationId: new ObjectId(req.organizationId) },
+        { sort: { createdAt: -1 } }
+      );
+
+      res.json({
+        success: true,
+        data: request || null,
+      });
+    } catch (error) {
+      logger.error("Error fetching subscription request:", {
+        error: error.message,
+      });
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch subscription request",
+        error: error.message,
+      });
+    }
+  }
+);
+
+// POST /subscriptions/request - Submit a subscription upgrade/downgrade request
+app.post(
+  "/subscriptions/request",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  checkOrganizationSuspension,
+  async (req, res) => {
+    try {
+      if (req.userRole !== "org_owner") {
+        return res.status(403).json({
+          success: false,
+          message: "Only organization owners can request subscription changes",
+        });
+      }
+
+      const { requestedTier, requestedBillingCycle = "monthly", reason } =
+        req.body;
+
+      if (!requestedTier) {
+        return res.status(400).json({
+          success: false,
+          message: "Requested tier is required",
+        });
+      }
+
+      const validTiers = ["free", "basic", "professional", "enterprise"];
+      if (!validTiers.includes(requestedTier)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid tier. Must be one of: free, basic, professional, enterprise",
+        });
+      }
+
+      const validCycles = ["monthly", "yearly"];
+      if (!validCycles.includes(requestedBillingCycle)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid billing cycle. Must be monthly or yearly",
+        });
+      }
+
+      // Get current subscription
+      const subscription = await subscriptionsCollection.findOne({
+        organizationId: new ObjectId(req.organizationId),
+      });
+
+      if (!subscription) {
+        return res.status(404).json({
+          success: false,
+          message: "Current subscription not found",
+        });
+      }
+
+      if (subscription.tier === requestedTier) {
+        return res.status(400).json({
+          success: false,
+          message: "You are already on this plan",
+        });
+      }
+
+      // Check if there's already a pending request
+      const existingRequest = await subscriptionRequestsCollection.findOne({
+        organizationId: new ObjectId(req.organizationId),
+        status: "pending",
+      });
+
+      if (existingRequest) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "You already have a pending subscription request. Please wait for it to be reviewed.",
+        });
+      }
+
+      const request = {
+        organizationId: new ObjectId(req.organizationId),
+        requestedBy: new ObjectId(req.userId),
+        currentTier: subscription.tier,
+        requestedTier,
+        requestedBillingCycle,
+        status: "pending",
+        reason: reason || "",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      // Use replaceOne + upsert to handle the unique index on organizationId.
+      // An org can only have one request document at a time; approved/rejected
+      // requests get replaced when a new request is submitted.
+      const result = await subscriptionRequestsCollection.findOneAndReplace(
+        { organizationId: req.organizationObjectId },
+        request,
+        { upsert: true, returnDocument: "after" }
+      );
+
+      const savedId = result?._id || new ObjectId(req.organizationId);
+
+      await logActivity(
+        req.userId,
+        req.organizationId,
+        "created",
+        "subscription_request",
+        savedId,
+        { currentTier: subscription.tier, requestedTier, requestedBillingCycle },
+        req
+      );
+
+      res.status(201).json({
+        success: true,
+        message:
+          "Subscription request submitted successfully. Our team will review it shortly.",
+        data: { _id: savedId, ...request },
+      });
+    } catch (error) {
+      logger.error("Error creating subscription request:", {
+        error: error.message,
+      });
+      res.status(500).json({
+        success: false,
+        message: "Failed to submit subscription request",
         error: error.message,
       });
     }
@@ -2019,7 +2236,7 @@ app.get(
   authenticateUser,
   enforceOrganizationIsolation,
   checkOrganizationSuspension,
-  requirePermission("manage_classes"),
+  requirePermission("view_classes"),
   async (req, res) => {
     try {
       const { academicYear, status, search } = req.query;
@@ -2361,7 +2578,7 @@ app.get(
   authenticateUser,
   enforceOrganizationIsolation,
   checkOrganizationSuspension,
-  requirePermission("manage_sections"),
+  requirePermission("view_sections"),
   async (req, res) => {
     try {
       const { classId, status } = req.query;
@@ -2714,7 +2931,7 @@ app.get(
   authenticateUser,
   enforceOrganizationIsolation,
   checkOrganizationSuspension,
-  requirePermission("manage_subjects"),
+  requirePermission("view_subjects"),
   async (req, res) => {
     try {
       const { classId, teacherId } = req.query;
@@ -3472,8 +3689,8 @@ app.post(
         parentId,
         academicYear,
         previousInstitute,
-        firebaseUid,
         photoURL,
+        password,
       } = req.body;
 
       if (!name || !email || !classId || !sectionId || !admissionNumber) {
@@ -3545,6 +3762,7 @@ app.post(
 
       // Create or link user account
       let userId;
+      let createdFirebaseUid = null;
       let existingUser = await usersCollection.findOne({ email });
 
       if (existingUser) {
@@ -3559,7 +3777,6 @@ app.post(
                 permissions: ROLE_PERMISSIONS.student,
                 name: name || existingUser.name,
                 photoURL: photoURL || existingUser.photoURL || "",
-                ...(firebaseUid && { firebaseUid }),
                 status: "active",
                 updatedAt: new Date(),
               },
@@ -3579,13 +3796,29 @@ app.post(
           });
         }
       } else {
-        // Create new user
+        // New user — password required, create Firebase account first
+        if (!password) {
+          return res.status(400).json({
+            success: false,
+            message: "password is required when creating a new student account",
+          });
+        }
+        if (password.length < 6) {
+          return res.status(400).json({
+            success: false,
+            message: "password must be at least 6 characters",
+          });
+        }
+
+        const fbResult = await createFirebaseUser(email, password, name);
+        createdFirebaseUid = fbResult.uid;
+
         const newUser = {
           name,
           email,
           password: "",
           phone: phone || "",
-          ...(firebaseUid && { firebaseUid }),
+          firebaseUid: createdFirebaseUid,
           photoURL: photoURL || "",
           organizationId: req.organizationId,
           role: "student",
@@ -3604,7 +3837,15 @@ app.post(
           updatedAt: new Date(),
         };
 
-        const userResult = await usersCollection.insertOne(newUser);
+        let userResult;
+        try {
+          userResult = await usersCollection.insertOne(newUser);
+        } catch (mongoErr) {
+          if (createdFirebaseUid && !fbResult.alreadyExisted) {
+            try { await adminAuth.deleteUser(createdFirebaseUid); } catch (_) {}
+          }
+          throw mongoErr;
+        }
         userId = userResult.insertedId;
       }
 
@@ -3659,7 +3900,15 @@ app.post(
         updatedAt: new Date(),
       };
 
-      const result = await studentsCollection.insertOne(newStudent);
+      let result;
+      try {
+        result = await studentsCollection.insertOne(newStudent);
+      } catch (mongoErr) {
+        if (createdFirebaseUid && !existingUser) {
+          try { await adminAuth.deleteUser(createdFirebaseUid); } catch (_) {}
+        }
+        throw mongoErr;
+      }
 
       // If parentId is provided, add student to parent's children[]
       if (parentId) {
@@ -4354,6 +4603,41 @@ app.get(
 
 // --- Teachers Endpoints ---
 
+// GET /teachers/me - Get current teacher's own profile (used by teacher dashboard)
+app.get(
+  "/teachers/me",
+  ensureDBConnection,
+  authenticateUser,
+  enforceOrganizationIsolation,
+  checkOrganizationSuspension,
+  requirePermission("create_grade_draft"),
+  async (req, res) => {
+    try {
+      const teacherDoc = await teachersCollection.findOne({
+        organizationId: req.organizationId,
+        userId: req.userId,
+        status: "active",
+      });
+
+      if (!teacherDoc) {
+        return res.status(404).json({
+          success: false,
+          message: "Teacher profile not found for the current user",
+        });
+      }
+
+      res.json({ success: true, data: teacherDoc });
+    } catch (error) {
+      logger.error("Error fetching teacher profile:", { error: error.message });
+      res.status(500).json({
+        success: false,
+        message: "Failed to fetch teacher profile",
+        error: error.message,
+      });
+    }
+  }
+);
+
 // GET /teachers - List teachers
 app.get(
   "/teachers",
@@ -4552,8 +4836,8 @@ app.post(
         qualification,
         specialization,
         joiningDate,
-        firebaseUid,
         photoURL,
+        password,
       } = req.body;
 
       if (!name || !email) {
@@ -4577,6 +4861,7 @@ app.post(
 
       // Create or link user account
       let userId;
+      let createdFirebaseUid = null;
       let existingUser = await usersCollection.findOne({ email });
 
       if (existingUser) {
@@ -4590,7 +4875,6 @@ app.post(
                 permissions: ROLE_PERMISSIONS.teacher,
                 name: name || existingUser.name,
                 photoURL: photoURL || existingUser.photoURL || "",
-                ...(firebaseUid && { firebaseUid }),
                 status: "active",
                 updatedAt: new Date(),
               },
@@ -4620,12 +4904,29 @@ app.post(
           });
         }
       } else {
+        // New user — password required, create Firebase account first
+        if (!password) {
+          return res.status(400).json({
+            success: false,
+            message: "password is required when creating a new teacher account",
+          });
+        }
+        if (password.length < 6) {
+          return res.status(400).json({
+            success: false,
+            message: "password must be at least 6 characters",
+          });
+        }
+
+        const fbResult = await createFirebaseUser(email, password, name);
+        createdFirebaseUid = fbResult.uid;
+
         const newUser = {
           name,
           email,
           password: "",
           phone: phone || "",
-          ...(firebaseUid && { firebaseUid }),
+          firebaseUid: createdFirebaseUid,
           photoURL: photoURL || "",
           organizationId: req.organizationId,
           role: "teacher",
@@ -4644,7 +4945,16 @@ app.post(
           updatedAt: new Date(),
         };
 
-        const userResult = await usersCollection.insertOne(newUser);
+        let userResult;
+        try {
+          userResult = await usersCollection.insertOne(newUser);
+        } catch (mongoErr) {
+          // Clean up Firebase account to avoid orphan
+          if (createdFirebaseUid && !fbResult.alreadyExisted) {
+            try { await adminAuth.deleteUser(createdFirebaseUid); } catch (_) {}
+          }
+          throw mongoErr;
+        }
         userId = userResult.insertedId;
       }
 
@@ -4662,7 +4972,16 @@ app.post(
         updatedAt: new Date(),
       };
 
-      const result = await teachersCollection.insertOne(newTeacher);
+      let result;
+      try {
+        result = await teachersCollection.insertOne(newTeacher);
+      } catch (mongoErr) {
+        // Clean up Firebase account to avoid orphan
+        if (createdFirebaseUid && !existingUser) {
+          try { await adminAuth.deleteUser(createdFirebaseUid); } catch (_) {}
+        }
+        throw mongoErr;
+      }
 
       // Increment usage counter
       await organizationsCollection.updateOne(
@@ -5386,8 +5705,8 @@ app.post(
         occupation,
         relationship,
         children,
-        firebaseUid,
         photoURL,
+        password,
       } = req.body;
 
       if (!name || !email) {
@@ -5399,6 +5718,7 @@ app.post(
 
       // Create or link user account
       let userId;
+      let createdFirebaseUid = null;
       let existingUser = await usersCollection.findOne({ email });
 
       if (existingUser) {
@@ -5412,7 +5732,6 @@ app.post(
                 permissions: ROLE_PERMISSIONS.parent,
                 name: name || existingUser.name,
                 photoURL: photoURL || existingUser.photoURL || "",
-                ...(firebaseUid && { firebaseUid }),
                 status: "active",
                 updatedAt: new Date(),
               },
@@ -5442,12 +5761,29 @@ app.post(
           });
         }
       } else {
+        // New user — password required, create Firebase account first
+        if (!password) {
+          return res.status(400).json({
+            success: false,
+            message: "password is required when creating a new parent account",
+          });
+        }
+        if (password.length < 6) {
+          return res.status(400).json({
+            success: false,
+            message: "password must be at least 6 characters",
+          });
+        }
+
+        const fbResult = await createFirebaseUser(email, password, name);
+        createdFirebaseUid = fbResult.uid;
+
         const newUser = {
           name,
           email,
           password: "",
           phone: phone || "",
-          ...(firebaseUid && { firebaseUid }),
+          firebaseUid: createdFirebaseUid,
           photoURL: photoURL || "",
           organizationId: req.organizationId,
           role: "parent",
@@ -5466,7 +5802,15 @@ app.post(
           updatedAt: new Date(),
         };
 
-        const userResult = await usersCollection.insertOne(newUser);
+        let userResult;
+        try {
+          userResult = await usersCollection.insertOne(newUser);
+        } catch (mongoErr) {
+          if (createdFirebaseUid && !fbResult.alreadyExisted) {
+            try { await adminAuth.deleteUser(createdFirebaseUid); } catch (_) {}
+          }
+          throw mongoErr;
+        }
         userId = userResult.insertedId;
       }
 
@@ -5504,7 +5848,15 @@ app.post(
         updatedAt: new Date(),
       };
 
-      const result = await parentsCollection.insertOne(newParent);
+      let result;
+      try {
+        result = await parentsCollection.insertOne(newParent);
+      } catch (mongoErr) {
+        if (createdFirebaseUid && !existingUser) {
+          try { await adminAuth.deleteUser(createdFirebaseUid); } catch (_) {}
+        }
+        throw mongoErr;
+      }
 
       // Update linked students' parentId
       if (childrenIds.length > 0) {
@@ -8127,7 +8479,7 @@ app.get(
   authenticateUser,
   enforceOrganizationIsolation,
   checkOrganizationSuspension,
-  requirePermission("review_grades"),
+  requirePermission("create_grade_draft"),
   async (req, res) => {
     try {
       const {
@@ -8142,6 +8494,18 @@ app.get(
       } = req.query;
 
       const query = { organizationId: req.organizationId };
+
+      // Teachers can only see their own submissions
+      if (req.userRole === "teacher") {
+        const teacherDoc = await teachersCollection.findOne({
+          organizationId: req.organizationId,
+          userId: req.userId,
+          status: "active",
+        });
+        if (teacherDoc) {
+          query.teacherId = teacherDoc._id;
+        }
+      }
 
       if (examId && ObjectId.isValid(examId)) {
         query.examId = new ObjectId(examId);
