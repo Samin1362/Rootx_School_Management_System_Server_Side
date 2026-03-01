@@ -38,6 +38,8 @@ app.use(
       "http://localhost:5174",
       "https://rootx-school-ms.vercel.app",
       "https://rootx-school-ms.web.app",
+      "https://rootx-school-ms-firebase.web.app",
+      "https://rootx-school-ms-firebase.firebaseapp.com",
     ],
     credentials: true,
   })
